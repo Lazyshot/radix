@@ -4,43 +4,55 @@ package main
 
 import (
 	"fmt"
-	"github.com/fzzy/radix/redis"
-	"os"
+	"github.com/fzzbt/radix/redis"
+	"strconv"
 	"time"
 )
 
-func errHndlr(err error) {
-	if err != nil {
-		fmt.Println("error:", err)
-		os.Exit(1)
-	}
-}
-
 func main() {
-	c, err := redis.DialTimeout("tcp", "127.0.0.1:6379", time.Duration(10)*time.Second)
-	errHndlr(err)
+	var c *redis.Client
+
+	conf := redis.DefaultConfig()
+	// Network and address
+	//
+	// Default are "tcp" and "127.0.0.1:6379" so these are commented out.
+
+	// TCP example:
+	// conf.Network = "tcp"
+	// conf.Address = "127.0.0.1:6379"
+
+	// Unix example: 
+	// conf.Network = "unix"
+	// conf.Address = "/tmp/redis.sock"
+
+	conf.Database = 8                              // Database number 
+	conf.Timeout = time.Duration(10) * time.Second // Socket timeout
+	c = redis.NewClient(conf)
+
 	defer c.Close()
 
-	// select database
-	r := c.Cmd("select", 8)
-	errHndlr(r.Err)
-
-	r = c.Cmd("flushdb")
-	errHndlr(r.Err)
-
-	r = c.Cmd("echo", "Hello world!")
-	errHndlr(r.Err)
-
-	s, err := r.Str()
-	errHndlr(err)
-	fmt.Println("echo:", s)
+	//** Blocking calls
+	rep := c.Flushdb()
+	if rep.Err != nil {
+		fmt.Println("redis:", rep.Err)
+		return
+	}
 
 	//* Strings
-	r = c.Cmd("set", "mykey0", "myval0")
-	errHndlr(r.Err)
 
-	s, err = c.Cmd("get", "mykey0").Str()
-	errHndlr(err)
+	// It's generally good idea to check for errors like this,
+	// but for the sake of keeping this example short we'll omit these from now on.
+	if rep = c.Set("mykey0", "myval0"); rep.Err != nil {
+		fmt.Println("redis:", rep.Err)
+		return
+	}
+
+	s, err := c.Get("mykey0").Str()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
 	fmt.Println("mykey0:", s)
 
 	myhash := map[string]string{
@@ -50,48 +62,164 @@ func main() {
 	}
 
 	// Alternatively:
-	// c.Cmd("mset", "mykey1", "myval1", "mykey2", "myval2", "mykey3", "myval3")
-	r = c.Cmd("mset", myhash)
-	errHndlr(r.Err)
+	// c.Mset("mykey1", "myval1", "mykey2", "myval2", "mykey3", "myval3")
+	c.Mset(myhash)
 
-	ls, err := c.Cmd("mget", "mykey1", "mykey2", "mykey3").List()
-	errHndlr(err)
+	ls, err := c.Mget("mykey1", "mykey2", "mykey3").List()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
 	fmt.Println("mykeys values:", ls)
 
 	//* List handling
 	mylist := []string{"foo", "bar", "qux"}
 
 	// Alternativaly:
-	// c.Cmd("rpush", "mylist", "foo", "bar", "qux")
-	r = c.Cmd("rpush", "mylist", mylist)
-	errHndlr(r.Err)
+	// c.Rpush("mylist", "foo", "bar", "qux")
+	c.Rpush("mylist", mylist)
 
-	mylist, err = c.Cmd("lrange", "mylist", 0, -1).List()
-	errHndlr(err)
+	mylist, err = c.Lrange("mylist", 0, -1).List()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 
 	fmt.Println("mylist:", mylist)
 
 	//* Hash handling
 
 	// Alternatively:
-	// c.Cmd("hmset", "myhash", ""mykey1", "myval1", "mykey2", "myval2", "mykey3", "myval3")
-	r = c.Cmd("hmset", "myhash", myhash)
-	errHndlr(r.Err)
+	// c.Hmset("myhash", ""mykey1", "myval1", "mykey2", "myval2", "mykey3", "myval3")
+	c.Hmset("myhash", myhash)
 
-	myhash, err = c.Cmd("hgetall", "myhash").Hash()
-	errHndlr(err)
+	myhash, err = c.Hgetall("myhash").Hash()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 
 	fmt.Println("myhash:", myhash)
 
-	//* Pipelining
-	c.Append("set", "multikey", "multival")
-	c.Append("get", "multikey")
+	//* Multicalls
+	rep = c.MultiCall(func(mc *redis.MultiCall) {
+		mc.Set("multikey", "multival")
+		mc.Get("multikey")
+	})
+	// Multicall reply is guaranteed to have the same number of sub-replies as calls,
+	// if it succeeds. They can be accessed through Reply.Elems.
+	if rep.Err != nil {
+		fmt.Println(rep.Err)
+		return
+	}
 
-	c.GetReply()     // set
-	r = c.GetReply() // get
-	errHndlr(r.Err)
+	s, err = rep.Elems[1].Str()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
 
-	s, err = r.Str()
-	errHndlr(err)
 	fmt.Println("multikey:", s)
+
+	//* Transactions
+	rep = c.Transaction(func(mc *redis.MultiCall) {
+		mc.Set("trankey", "tranval")
+		mc.Get("trankey")
+	})
+	if rep.Err != nil {
+		fmt.Println(rep.Err)
+		return
+	}
+
+	s, err = rep.Elems[1].Str()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	fmt.Println("trankey:", s)
+
+	//* Complex transactions
+	//  Atomic INCR replacement with transactions
+	myIncr := func(key string) *redis.Reply {
+		return c.MultiCall(func(mc *redis.MultiCall) {
+			var curval int
+
+			mc.Watch(key)
+			mc.Get(key)
+			rep := mc.Flush()
+			if rep.Err != nil {
+				return
+			}
+
+			s, err := rep.Elems[1].Str()
+			if err == nil {
+				curval, err = strconv.Atoi(s)
+			}
+			nextval := curval + 1
+
+			mc.Multi()
+			mc.Set(key, nextval)
+			mc.Exec()
+		})
+	}
+
+	myIncr("ctrankey")
+	myIncr("ctrankey")
+	myIncr("ctrankey")
+
+	s, err = c.Get("ctrankey").Str()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	fmt.Println("ctrankey:", s)
+
+	//** Asynchronous calls
+	c.Set("asynckey", "asyncval")
+	fut := c.AsyncGet("asynckey")
+
+	// do something here
+
+	// block until reply is available
+	s, err = fut.Reply().Str()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	fmt.Println("asynckey:", s)
+
+	//* Pub/sub
+	msgHdlr := func(msg *redis.Message) {
+		switch msg.Type {
+		case redis.MessageMessage:
+			fmt.Printf("Received message \"%s\" from channel \"%s\".\n", msg.Payload, msg.Channel)
+		case redis.MessagePmessage:
+			fmt.Printf("Received pattern message \"%s\" from channel \"%s\" with pattern "+
+				"\"%s\".\n", msg.Payload, msg.Channel, msg.Pattern)
+		default:
+			fmt.Println("Received other message:", msg)
+		}
+	}
+
+	sub, err_ := c.Subscription(msgHdlr)
+	if err_ != nil {
+		fmt.Printf("Failed to subscribe: '%s'!\n", err_)
+		return
+	}
+
+	defer sub.Close()
+
+	sub.Subscribe("chan1", "chan2")
+	sub.Psubscribe("chan*")
+
+	c.Publish("chan1", "foo")
+	sub.Unsubscribe("chan1")
+	c.Publish("chan2", "bar")
+
+	// give some time for the message handler to receive the messages
+	time.Sleep(time.Second)
 }

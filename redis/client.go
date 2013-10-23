@@ -1,230 +1,134 @@
 package redis
 
-import (
-	"bufio"
-	"bytes"
-	"errors"
-	"net"
-	"strconv"
-	"time"
-)
-
-const (
-	bufSize int = 4096
-)
-
-//* Common errors
-
-var AuthError error = errors.New("authentication failed")
-var LoadingError error = errors.New("server is busy loading dataset in memory")
-var ParseError error = errors.New("parse error")
-var PipelineQueueEmptyError error = errors.New("pipeline queue empty")
-
 //* Client
 
-// Client describes a Redis client.
+// Client manages the access to a database.
 type Client struct {
-	conn      net.Conn
-	timeout   time.Duration
-	reader    *bufio.Reader
-	pending   []*request
-	completed []*Reply
+	config Config
+	pool   *connPool
 }
 
-// Dial connects to the given Redis server with the given timeout.
-func DialTimeout(network, addr string, timeout time.Duration) (*Client, error) {
-	// establish a connection
-	conn, err := net.Dial(network, addr)
+// NewClient creates a new Client.
+func NewClient(config Config) *Client {
+	c := new(Client)
+	c.config = config
+	c.pool = newConnPool(&c.config)
+	return c
+}
+
+// Close closes all connections of the client.
+func (c *Client) Close() {
+	c.pool.close()
+}
+
+func (c *Client) call(cmd Cmd, args ...interface{}) *Reply {
+	// Connection handling
+	conn, err := c.pool.pull()
+	if err != nil {
+		return &Reply{Type: ReplyError, Err: err}
+	}
+
+	defer c.pool.push(conn)
+	return conn.call(Cmd(cmd), args...)
+}
+
+// Call calls the given Redis command.
+func (c *Client) Call(cmd string, args ...interface{}) *Reply {
+	return c.call(Cmd(cmd), args...)
+}
+
+func (c *Client) asyncCall(cmd Cmd, args ...interface{}) Future {
+	f := newFuture()
+
+	go func() {
+		f <- c.call(cmd, args...)
+	}()
+
+	return f
+}
+
+// AsyncCall calls the given Redis command asynchronously.
+func (c *Client) AsyncCall(cmd string, args ...interface{}) Future {
+	return c.asyncCall(Cmd(cmd), args...)
+}
+
+// InfoMap calls the INFO command, parses and returns the results as a map[string]string or an error. 
+// Use Info method for fetching the unparsed INFO results.
+func (c *Client) InfoMap() (map[string]string, error) {
+	// Connection handling
+	conn, err := c.pool.pull()
 	if err != nil {
 		return nil, err
 	}
 
-	c := new(Client)
-	c.conn = conn
-	c.timeout = timeout
-	c.reader = bufio.NewReaderSize(conn, bufSize)
-	return c, nil
+	defer c.pool.push(conn)
+	return conn.infoMap()
+
 }
 
-// Dial connects to the given Redis server.
-func Dial(network, addr string) (*Client, error) {
-	return DialTimeout(network, addr, time.Duration(0))
-}
+func (c *Client) multiCall(transaction bool, f func(*MultiCall)) *Reply {
+	// Connection handling
+	conn, err := c.pool.pull()
 
-//* Public methods
-
-// Close closes the connection.
-func (c *Client) Close() error {
-	return c.conn.Close()
-}
-
-// Cmd calls the given Redis command.
-func (c *Client) Cmd(cmd string, args ...interface{}) *Reply {
-	err := c.writeRequest(&request{cmd, args})
 	if err != nil {
-		return &Reply{Type: ErrorReply, Err: err}
+		return &Reply{Type: ReplyError, Err: err}
 	}
-	return c.readReply()
+
+	defer c.pool.push(conn)
+	return newMultiCall(transaction, conn).process(f)
 }
 
-// Append adds the given call to the pipeline queue.
-// Use GetReply() to read the reply.
-func (c *Client) Append(cmd string, args ...interface{}) {
-	c.pending = append(c.pending, &request{cmd, args})
+// MultiCall executes the given MultiCall.
+// Multicall reply is guaranteed to have the same number of sub-replies as calls, if it succeeds.
+func (c *Client) MultiCall(f func(*MultiCall)) *Reply {
+	return c.multiCall(false, f)
 }
 
-// GetReply returns the reply for the next request in the pipeline queue.
-// Error reply with PipelineQueueEmptyError is returned,
-// if the pipeline queue is empty.
-func (c *Client) GetReply() *Reply {
-	if len(c.completed) > 0 {
-		r := c.completed[0]
-		c.completed = c.completed[1:]
-		return r
-	}
-	c.completed = nil
+// Transaction performs a simple transaction.
+// Simple transaction is a multi command that is wrapped in a MULTI-EXEC block.
+// For complex transactions with WATCH, UNWATCH or DISCARD commands use MultiCall.
+// Transaction reply is guaranteed to have the same number of sub-replies as calls, if it succeeds.
+func (c *Client) Transaction(f func(*MultiCall)) *Reply {
+	return c.multiCall(true, f)
+}
 
-	if len(c.pending) == 0 {
-		return &Reply{Type: ErrorReply, Err: PipelineQueueEmptyError}
+// AsyncMultiCall calls an asynchronous MultiCall.
+func (c *Client) AsyncMultiCall(mc func(*MultiCall)) Future {
+	f := newFuture()
+
+	go func() {
+		f <- c.MultiCall(mc)
+	}()
+
+	return f
+}
+
+// AsyncTransaction performs a simple asynchronous transaction.
+func (c *Client) AsyncTransaction(mc func(*MultiCall)) Future {
+	f := newFuture()
+
+	go func() {
+		f <- c.Transaction(mc)
+	}()
+
+	return f
+}
+
+//* PubSub
+
+// Subscription returns a new Subscription instance with the given message handler callback or
+// an error. The message handler is called whenever a new message arrives.
+// Subscriptions create their own dedicated connections,
+// they do not pull connections from the connection pool.
+func (c *Client) Subscription(msgHdlr func(msg *Message)) (*Subscription, *Error) {
+	if msgHdlr == nil {
+		panic(errmsg("message handler must not be nil"))
 	}
 
-	nreqs := len(c.pending)
-	err := c.writeRequest(c.pending...)
-	c.pending = nil
+	sub, err := newSubscription(&c.config, msgHdlr)
 	if err != nil {
-		return &Reply{Type: ErrorReply, Err: err}
-	}
-	r := c.readReply()
-	c.completed = make([]*Reply, nreqs-1)
-	for i := 0; i < nreqs-1; i++ {
-		c.completed[i] = c.readReply()
+		return nil, err
 	}
 
-	return r
-}
-
-//* Private methods
-
-func (c *Client) setReadTimeout() {
-	if c.timeout != 0 {
-		c.conn.SetReadDeadline(time.Now().Add(c.timeout))
-	}
-}
-
-func (c *Client) setWriteTimeout() {
-	if c.timeout != 0 {
-		c.conn.SetWriteDeadline(time.Now().Add(c.timeout))
-	}
-}
-
-func (c *Client) readReply() *Reply {
-	c.setReadTimeout()
-	return c.parse()
-}
-
-func (c *Client) writeRequest(requests ...*request) error {
-	c.setWriteTimeout()
-	_, err := c.conn.Write(createRequest(requests...))
-	if err != nil {
-		c.Close()
-		return err
-	}
-	return nil
-}
-
-func (c *Client) parse() (r *Reply) {
-	r = new(Reply)
-	b, err := c.reader.ReadBytes('\n')
-	if err != nil {
-		c.Close()
-		r.Type = ErrorReply
-		r.Err = err
-		return
-	}
-
-	fb := b[0]
-	b = b[1 : len(b)-2] // get rid of the first byte and the trailing \r\n
-	switch fb {
-	case '-':
-		// error reply
-		r.Type = ErrorReply
-		if bytes.HasPrefix(b, []byte("LOADING")) {
-			r.Err = LoadingError
-		} else {
-			r.Err = errors.New(string(b))
-		}
-	case '+':
-		// status reply
-		r.Type = StatusReply
-		r.buf = b
-	case ':':
-		// integer reply
-		i, err := strconv.ParseInt(string(b), 10, 64)
-		if err != nil {
-			r.Type = ErrorReply
-			r.Err = ParseError
-		} else {
-			r.Type = IntegerReply
-			r.int = i
-		}
-	case '$':
-		// bulk reply
-		i, err := strconv.Atoi(string(b))
-		if err != nil {
-			r.Type = ErrorReply
-			r.Err = ParseError
-		} else {
-			if i == -1 {
-				// null bulk reply (key not found)
-				r.Type = NilReply
-			} else {
-				// bulk reply
-				ir := i + 2
-				br := make([]byte, ir)
-				rc := 0
-
-				for rc < ir {
-					n, err := c.reader.Read(br[rc:])
-					if err != nil {
-						c.Close()
-						r.Type = ErrorReply
-						r.Err = err
-					}
-					rc += n
-				}
-				r.Type = BulkReply
-				r.buf = br[0:i]
-			}
-		}
-	case '*':
-		// multi bulk reply
-		i, err := strconv.Atoi(string(b))
-		if err != nil {
-			r.Type = ErrorReply
-			r.Err = ParseError
-		} else {
-			switch {
-			case i == -1:
-				// null multi bulk
-				r.Type = NilReply
-			case i >= 0:
-				// multi bulk
-				// parse the replies recursively
-				r.Type = MultiReply
-				r.Elems = make([]*Reply, i)
-				for i := range r.Elems {
-					r.Elems[i] = c.parse()
-				}
-			default:
-				// invalid multi bulk reply
-				r.Type = ErrorReply
-				r.Err = ParseError
-			}
-		}
-	default:
-		// invalid reply
-		r.Type = ErrorReply
-		r.Err = ParseError
-	}
-	return
+	return sub, nil
 }
